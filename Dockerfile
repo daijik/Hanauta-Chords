@@ -10,7 +10,7 @@ COPY --chown=1001:0 package*.json ./
 RUN npm ci
 COPY --chown=1001:0 . .
 EXPOSE 5173
-CMD ["npm", "run", "dev"]
+CMD ["node", "server.js"]
 
 # ── ビルドステージ ────────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-20:latest AS build
@@ -26,11 +26,19 @@ COPY --chown=1001:0 . .
 RUN npm run build
 
 # ── 本番ステージ ──────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/nginx-120:latest AS prod
+FROM registry.access.redhat.com/ubi9/nodejs-20:latest AS prod
 
 USER root
-COPY --from=build --chown=1001:0 /app/dist /usr/share/nginx/html
+RUN mkdir -p /app && chown -R 1001:0 /app
 USER 1001
 
+WORKDIR /app
+COPY --chown=1001:0 package*.json ./
+RUN npm ci --omit=dev
+COPY --from=build --chown=1001:0 /app/dist ./dist
+COPY --chown=1001:0 server.js ./
+
 EXPOSE 8080
-CMD ["nginx", "-g", "daemon off;"]
+ENV PORT=8080
+ENV NODE_ENV=production
+CMD ["node", "server.js"]
