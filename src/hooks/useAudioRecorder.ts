@@ -71,6 +71,7 @@ export function useAudioRecorder(bpm: number) {
   const [countdownBeat, setCountdownBeat] = useState(0)
   const [notes, setNotes] = useState<DetectedNote[]>([])
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null)
+  const [analysisError, setAnalysisError] = useState<string | null>(null)
 
   const streamRef = useRef<MediaStream | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -135,13 +136,18 @@ export function useAudioRecorder(bpm: number) {
       prevUrlRef.current = url
       setRecordedAudioUrl(url)
 
-      // Python API で解析
       setRecordingState('analyzing')
+      setAnalysisError(null)
       try {
         const detected = await detectPitchWithML(blob, bpmRef.current)
         setNotes(detected)
+        if (detected.length === 0) {
+          setAnalysisError('音符を検出できませんでした。もう少し大きめに、はっきり歌ってみてください。')
+        }
       } catch (err) {
-        console.error('解析エラー:', err)
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error('Basic Pitch エラー:', err)
+        setAnalysisError(`解析エラー: ${msg}`)
       } finally {
         setRecordingState('idle')
       }
@@ -178,6 +184,7 @@ export function useAudioRecorder(bpm: number) {
     countdownBeat,
     notes,
     recordedAudioUrl,
+    analysisError,
     startRecording,
     stopRecording,
   }

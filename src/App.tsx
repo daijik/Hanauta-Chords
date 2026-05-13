@@ -34,6 +34,7 @@ function App() {
     countdownBeat,
     notes,
     recordedAudioUrl,
+    analysisError,
     startRecording,
     stopRecording,
   } = useAudioRecorder(bpm)
@@ -200,6 +201,9 @@ function App() {
 
           {error && (
             <p className="text-red-400 text-sm bg-red-900/30 rounded-lg px-3 py-2">{error}</p>
+          )}
+          {analysisError && (
+            <p className="text-orange-400 text-sm bg-orange-900/30 rounded-lg px-3 py-2">⚠ {analysisError}</p>
           )}
 
           <div className="flex gap-4 text-sm text-slate-400 flex-wrap">
