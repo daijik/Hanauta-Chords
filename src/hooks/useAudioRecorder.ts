@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react'
+import { useRef, useState, useCallback, useEffect } from 'react'
 import { PitchDetector } from 'pitchy'
 
 export type DetectedNote = {
@@ -7,6 +7,8 @@ export type DetectedNote = {
   time: number
   duration: number
 }
+
+export type RecordingState = 'idle' | 'countdown' | 'recording'
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -20,29 +22,75 @@ function midiToNoteName(midi: number): string {
   return `${note}${octave}`
 }
 
-// 直近 N フレームの MIDI 値の中央値を返す（ノイズ除去）
 function medianMidi(buf: number[]): number {
   const sorted = [...buf].sort((a, b) => a - b)
   return sorted[Math.floor(sorted.length / 2)]
 }
 
-const SMOOTH_FRAMES = 5       // 中央値を取るフレーム数
-const CLARITY_THRESHOLD = 0.78 // 0.85→0.78 に下げて鼻歌の弱い音も拾う
-const NOTE_CHANGE_SEMITONES = 1.5 // 音程変化の閾値（半音）
-const MIN_NOTE_DURATION = 0.10    // 最短音符長（秒）
+// カウントダウン用クリック音を Web Audio でスケジュール
+// 終了後に resolve する Promise を返す
+function scheduleCountdown(
+  ctx: AudioContext,
+  bpm: number,
+  beats: number,
+  onBeat: (beat: number) => void,
+): Promise<void> {
+  const beatDuration = 60 / bpm
+  const now = ctx.currentTime + 0.1
 
-export function useAudioRecorder() {
-  const [isRecording, setIsRecording] = useState(false)
+  for (let i = 0; i < beats; i++) {
+    const t = now + i * beatDuration
+    const isFirst = i === 0
+
+    const osc = ctx.createOscillator()
+    const gain = ctx.createGain()
+    osc.connect(gain)
+    gain.connect(ctx.destination)
+    osc.type = 'square'
+    osc.frequency.value = isFirst ? 880 : 660
+    gain.gain.setValueAtTime(0.5, t)
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.07)
+    osc.start(t)
+    osc.stop(t + 0.08)
+
+    // UI 更新は setTimeout で同期させる
+    const delay = (t - ctx.currentTime) * 1000
+    setTimeout(() => onBeat(i + 1), delay)
+  }
+
+  return new Promise(resolve =>
+    setTimeout(resolve, (now + beats * beatDuration - ctx.currentTime) * 1000),
+  )
+}
+
+const SMOOTH_FRAMES = 5
+const CLARITY_THRESHOLD = 0.78
+const NOTE_CHANGE_SEMITONES = 1.5
+const MIN_NOTE_DURATION = 0.10
+
+export function useAudioRecorder(bpm: number) {
+  const [recordingState, setRecordingState] = useState<RecordingState>('idle')
+  const [countdownBeat, setCountdownBeat] = useState(0)
   const [notes, setNotes] = useState<DetectedNote[]>([])
+  const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null)
 
   const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const rafRef = useRef<number | null>(null)
   const startTimeRef = useRef<number>(0)
-
   const pendingRef = useRef<{ midi: number; startTime: number } | null>(null)
   const collectedRef = useRef<DetectedNote[]>([])
-  const pitchBufRef = useRef<number[]>([])   // 直近フレームのピッチバッファ
+  const pitchBufRef = useRef<number[]>([])
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const audioChunksRef = useRef<Blob[]>([])
+  const prevUrlRef = useRef<string | null>(null)
+
+  // アンマウント時に Blob URL を解放
+  useEffect(() => {
+    return () => {
+      if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current)
+    }
+  }, [])
 
   const stopDetection = useCallback(() => {
     if (rafRef.current !== null) {
@@ -52,12 +100,18 @@ export function useAudioRecorder() {
   }, [])
 
   const startRecording = useCallback(async () => {
-    // echoCancellation / noiseSuppression を明示的に制御
+    // 前回の録音 URL を破棄
+    if (prevUrlRef.current) {
+      URL.revokeObjectURL(prevUrlRef.current)
+      prevUrlRef.current = null
+      setRecordedAudioUrl(null)
+    }
+
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,  // マイク入力を自動増幅
+        autoGainControl: true,
       },
     })
     streamRef.current = stream
@@ -65,27 +119,45 @@ export function useAudioRecorder() {
     const audioCtx = new AudioContext()
     audioCtxRef.current = audioCtx
 
-    // fftSize を 4096 に拡大 → 低音域の周波数分解能が 2 倍に向上
+    // ── カウントダウン ──────────────────────────────
+    setRecordingState('countdown')
+    setCountdownBeat(0)
+    await scheduleCountdown(audioCtx, bpm, 4, (beat) => setCountdownBeat(beat))
+    setCountdownBeat(0)
+
+    // ── 録音開始 ────────────────────────────────────
+    // MediaRecorder でオリジナル音声を録音
+    audioChunksRef.current = []
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
+    const mr = new MediaRecorder(stream, { mimeType })
+    mr.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
+    mr.onstop = () => {
+      const blob = new Blob(audioChunksRef.current, { type: mimeType })
+      const url = URL.createObjectURL(blob)
+      prevUrlRef.current = url
+      setRecordedAudioUrl(url)
+    }
+    mr.start(100)
+    mediaRecorderRef.current = mr
+
+    // ピッチ検出チェーン
     const analyser = audioCtx.createAnalyser()
     analyser.fftSize = 4096
-    analyser.smoothingTimeConstant = 0.3  // 時間方向のスムージング
+    analyser.smoothingTimeConstant = 0.3
 
-    // 入力コンプレッサー: 小さい鼻歌でも一定レベルまで持ち上げる
     const compressor = audioCtx.createDynamicsCompressor()
-    compressor.threshold.value = -40  // dB: これ以下の音も検出対象
+    compressor.threshold.value = -40
     compressor.knee.value = 20
     compressor.ratio.value = 12
     compressor.attack.value = 0.003
     compressor.release.value = 0.25
 
-    // 入力ゲイン: さらに増幅
     const inputGain = audioCtx.createGain()
     inputGain.gain.value = 3.0
 
-    // ハイパスフィルター: 低周波ノイズ（空調など）をカット
     const highpass = audioCtx.createBiquadFilter()
     highpass.type = 'highpass'
-    highpass.frequency.value = 70  // 70Hz 以下をカット
+    highpass.frequency.value = 70
 
     const source = audioCtx.createMediaStreamSource(stream)
     source.connect(highpass)
@@ -101,17 +173,12 @@ export function useAudioRecorder() {
     pendingRef.current = null
     pitchBufRef.current = []
     setNotes([])
-    setIsRecording(true)
+    setRecordingState('recording')
 
     const commitNote = (midi: number, startTime: number, endTime: number) => {
       const duration = endTime - startTime
       if (duration < MIN_NOTE_DURATION) return
-      const note: DetectedNote = {
-        name: midiToNoteName(midi),
-        midi,
-        time: startTime,
-        duration,
-      }
+      const note: DetectedNote = { name: midiToNoteName(midi), midi, time: startTime, duration }
       collectedRef.current = [...collectedRef.current, note]
       setNotes([...collectedRef.current])
     }
@@ -123,12 +190,8 @@ export function useAudioRecorder() {
 
       if (clarity > CLARITY_THRESHOLD && pitch > 70 && pitch < 1400) {
         const rawMidi = freqToMidi(pitch)
-
-        // ピッチバッファに追加して中央値で安定化
         pitchBufRef.current.push(rawMidi)
-        if (pitchBufRef.current.length > SMOOTH_FRAMES) {
-          pitchBufRef.current.shift()
-        }
+        if (pitchBufRef.current.length > SMOOTH_FRAMES) pitchBufRef.current.shift()
         const midi = medianMidi(pitchBufRef.current)
 
         const pending = pendingRef.current
@@ -139,7 +202,6 @@ export function useAudioRecorder() {
           pendingRef.current = { midi, startTime: now }
         }
       } else {
-        // 無声区間: バッファをリセット
         pitchBufRef.current = []
         const pending = pendingRef.current
         if (pending) {
@@ -152,7 +214,7 @@ export function useAudioRecorder() {
     }
 
     rafRef.current = requestAnimationFrame(tick)
-  }, [])
+  }, [bpm])
 
   const stopRecording = useCallback(() => {
     stopDetection()
@@ -173,10 +235,24 @@ export function useAudioRecorder() {
       pendingRef.current = null
     }
 
+    mediaRecorderRef.current?.stop()
+    mediaRecorderRef.current = null
     streamRef.current?.getTracks().forEach(t => t.stop())
     audioCtxRef.current?.close()
-    setIsRecording(false)
+    setRecordingState('idle')
   }, [stopDetection])
 
-  return { isRecording, notes, startRecording, stopRecording }
+  const isRecording = recordingState === 'recording'
+  const isCountingDown = recordingState === 'countdown'
+
+  return {
+    recordingState,
+    isRecording,
+    isCountingDown,
+    countdownBeat,
+    notes,
+    recordedAudioUrl,
+    startRecording,
+    stopRecording,
+  }
 }

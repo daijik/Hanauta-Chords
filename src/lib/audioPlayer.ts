@@ -119,7 +119,9 @@ export function playChordPattern(chords: string[], bpm = 72): () => void {
 export function playMelodyWithChords(
   notes: DetectedNote[],
   chords: string[],
+  bpm = 72,
 ): () => void {
+  void bpm  // 将来の拍割り改善用に保持
   if (notes.length === 0) return () => {}
   const ctx = new AudioContext()
   const master = createOutputChain(ctx)
