@@ -149,11 +149,7 @@ export function useAudioRecorder(bpm: number) {
     abortedRef.current = false
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false,  // true にするとポンピングが発生して音質が不自然になる
-      },
+      audio: true,  // ブラウザのデフォルトに委ねるのが最も自然な音質になる
     })
     streamRef.current = stream
 
