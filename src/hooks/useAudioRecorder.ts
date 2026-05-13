@@ -8,7 +8,7 @@ export type DetectedNote = {
   duration: number
 }
 
-export type RecordingState = 'idle' | 'countdown' | 'recording'
+export type RecordingState = 'idle' | 'countdown' | 'recording' | 'analyzing'
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -18,8 +18,7 @@ function freqToMidi(freq: number): number {
 
 function midiToNoteName(midi: number): string {
   const octave = Math.floor(midi / 12) - 1
-  const note = NOTE_NAMES[midi % 12]
-  return `${note}${octave}`
+  return `${NOTE_NAMES[midi % 12]}${octave}`
 }
 
 function medianMidi(buf: number[]): number {
@@ -27,8 +26,6 @@ function medianMidi(buf: number[]): number {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
-// カウントダウン用クリック音を Web Audio でスケジュール
-// 終了後に resolve する Promise を返す
 function scheduleCountdown(
   ctx: AudioContext,
   bpm: number,
@@ -40,22 +37,17 @@ function scheduleCountdown(
 
   for (let i = 0; i < beats; i++) {
     const t = now + i * beatDuration
-    const isFirst = i === 0
-
     const osc = ctx.createOscillator()
     const gain = ctx.createGain()
     osc.connect(gain)
     gain.connect(ctx.destination)
     osc.type = 'square'
-    osc.frequency.value = isFirst ? 880 : 660
+    osc.frequency.value = i === 0 ? 880 : 660
     gain.gain.setValueAtTime(0.5, t)
     gain.gain.exponentialRampToValueAtTime(0.001, t + 0.07)
     osc.start(t)
     osc.stop(t + 0.08)
-
-    // UI 更新は setTimeout で同期させる
-    const delay = (t - ctx.currentTime) * 1000
-    setTimeout(() => onBeat(i + 1), delay)
+    setTimeout(() => onBeat(i + 1), (t - ctx.currentTime) * 1000)
   }
 
   return new Promise(resolve =>
@@ -63,10 +55,109 @@ function scheduleCountdown(
   )
 }
 
-const SMOOTH_FRAMES = 5
-const CLARITY_THRESHOLD = 0.78
+// ─── オフライン音声解析 ──────────────────────────────────────────────────────
+
+const WINDOW_SIZE = 4096
+const SMOOTH_FRAMES = 7
+const CLARITY_THRESHOLD = 0.76
 const NOTE_CHANGE_SEMITONES = 1.5
 const MIN_NOTE_DURATION = 0.10
+
+async function preprocessAudio(blob: Blob): Promise<{ samples: Float32Array; sampleRate: number }> {
+  const arrayBuffer = await blob.arrayBuffer()
+
+  // まずデコードして実際のサンプルレートを取得
+  const tmpCtx = new AudioContext()
+  let srcBuffer: AudioBuffer
+  try {
+    srcBuffer = await tmpCtx.decodeAudioData(arrayBuffer)
+  } finally {
+    tmpCtx.close()
+  }
+
+  const { sampleRate, length } = srcBuffer
+
+  // OfflineAudioContext で前処理（ハイパス + コンプレッサー + ゲイン）
+  const offCtx = new OfflineAudioContext(1, length, sampleRate)
+
+  const source = offCtx.createBufferSource()
+  source.buffer = srcBuffer
+
+  const highpass = offCtx.createBiquadFilter()
+  highpass.type = 'highpass'
+  highpass.frequency.value = 70
+
+  const compressor = offCtx.createDynamicsCompressor()
+  compressor.threshold.value = -40
+  compressor.knee.value = 20
+  compressor.ratio.value = 12
+  compressor.attack.value = 0.003
+  compressor.release.value = 0.25
+
+  const gainNode = offCtx.createGain()
+  gainNode.gain.value = 4.0
+
+  source.connect(highpass)
+  highpass.connect(compressor)
+  compressor.connect(gainNode)
+  gainNode.connect(offCtx.destination)
+  source.start(0)
+
+  const rendered = await offCtx.startRendering()
+  return { samples: rendered.getChannelData(0), sampleRate }
+}
+
+async function analyzeAudioBlob(blob: Blob): Promise<DetectedNote[]> {
+  const { samples, sampleRate } = await preprocessAudio(blob)
+
+  const detector = PitchDetector.forFloat32Array(WINDOW_SIZE)
+  // ~80フレーム/秒の解析密度
+  const hopSize = Math.floor(sampleRate / 80)
+
+  const pitchBuf: number[] = []
+  const notes: DetectedNote[] = []
+  let pending: { midi: number; startTime: number } | null = null
+
+  const commitNote = (midi: number, startTime: number, endTime: number) => {
+    const duration = endTime - startTime
+    if (duration >= MIN_NOTE_DURATION) {
+      notes.push({ name: midiToNoteName(midi), midi, time: startTime, duration })
+    }
+  }
+
+  for (let i = 0; i + WINDOW_SIZE < samples.length; i += hopSize) {
+    const window = samples.slice(i, i + WINDOW_SIZE)
+    const [pitch, clarity] = detector.findPitch(window, sampleRate)
+    const time = i / sampleRate
+
+    if (clarity > CLARITY_THRESHOLD && pitch > 70 && pitch < 1400) {
+      pitchBuf.push(freqToMidi(pitch))
+      if (pitchBuf.length > SMOOTH_FRAMES) pitchBuf.shift()
+      const midi = medianMidi(pitchBuf)
+
+      if (!pending) {
+        pending = { midi, startTime: time }
+      } else if (Math.abs(midi - pending.midi) > NOTE_CHANGE_SEMITONES) {
+        commitNote(pending.midi, pending.startTime, time)
+        pending = { midi, startTime: time }
+      }
+    } else {
+      pitchBuf.length = 0
+      if (pending) {
+        commitNote(pending.midi, pending.startTime, time)
+        pending = null
+      }
+    }
+  }
+
+  if (pending) {
+    commitNote(pending.midi, pending.startTime, samples.length / sampleRate)
+  }
+
+  return notes
+}
+
+// ─── Hook ───────────────────────────────────────────────────────────────────
 
 export function useAudioRecorder(bpm: number) {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle')
@@ -74,181 +165,97 @@ export function useAudioRecorder(bpm: number) {
   const [notes, setNotes] = useState<DetectedNote[]>([])
   const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null)
 
-  const audioCtxRef = useRef<AudioContext | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const rafRef = useRef<number | null>(null)
-  const startTimeRef = useRef<number>(0)
-  const pendingRef = useRef<{ midi: number; startTime: number } | null>(null)
-  const collectedRef = useRef<DetectedNote[]>([])
-  const pitchBufRef = useRef<number[]>([])
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const prevUrlRef = useRef<string | null>(null)
+  const abortedRef = useRef(false)   // カウントダウン中に停止された場合のフラグ
 
-  // アンマウント時に Blob URL を解放
   useEffect(() => {
-    return () => {
-      if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current)
-    }
-  }, [])
-
-  const stopDetection = useCallback(() => {
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current)
-      rafRef.current = null
-    }
+    return () => { if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current) }
   }, [])
 
   const startRecording = useCallback(async () => {
-    // 前回の録音 URL を破棄
+    // 前回録音をクリア
     if (prevUrlRef.current) {
       URL.revokeObjectURL(prevUrlRef.current)
       prevUrlRef.current = null
       setRecordedAudioUrl(null)
     }
+    setNotes([])
+    abortedRef.current = false
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     })
     streamRef.current = stream
 
-    const audioCtx = new AudioContext()
-    audioCtxRef.current = audioCtx
-
-    // ── カウントダウン ──────────────────────────────
+    // ── カウントダウン ───────────────────────────────────────
+    const clickCtx = new AudioContext()
     setRecordingState('countdown')
     setCountdownBeat(0)
-    await scheduleCountdown(audioCtx, bpm, 4, (beat) => setCountdownBeat(beat))
+    await scheduleCountdown(clickCtx, bpm, 4, (beat) => setCountdownBeat(beat))
+    clickCtx.close()
     setCountdownBeat(0)
 
-    // ── 録音開始 ────────────────────────────────────
-    // MediaRecorder でオリジナル音声を録音
+    if (abortedRef.current) {
+      // 停止ボタンが押された場合はここで終了
+      stream.getTracks().forEach(t => t.stop())
+      setRecordingState('idle')
+      return
+    }
+
+    // ── 録音開始（MediaRecorder のみ。リアルタイム検出は行わない）──
     audioChunksRef.current = []
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
     const mr = new MediaRecorder(stream, { mimeType })
+
     mr.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
-    mr.onstop = () => {
+
+    mr.onstop = async () => {
+      // Blob URL を生成（オリジナル再生用）
       const blob = new Blob(audioChunksRef.current, { type: mimeType })
       const url = URL.createObjectURL(blob)
       prevUrlRef.current = url
       setRecordedAudioUrl(url)
+
+      // ── オフライン解析 ────────────────────────────────────
+      setRecordingState('analyzing')
+      try {
+        const detected = await analyzeAudioBlob(blob)
+        setNotes(detected)
+      } catch (err) {
+        console.error('音声解析エラー:', err)
+      } finally {
+        setRecordingState('idle')
+      }
     }
+
     mr.start(100)
     mediaRecorderRef.current = mr
-
-    // ピッチ検出チェーン
-    const analyser = audioCtx.createAnalyser()
-    analyser.fftSize = 4096
-    analyser.smoothingTimeConstant = 0.3
-
-    const compressor = audioCtx.createDynamicsCompressor()
-    compressor.threshold.value = -40
-    compressor.knee.value = 20
-    compressor.ratio.value = 12
-    compressor.attack.value = 0.003
-    compressor.release.value = 0.25
-
-    const inputGain = audioCtx.createGain()
-    inputGain.gain.value = 3.0
-
-    const highpass = audioCtx.createBiquadFilter()
-    highpass.type = 'highpass'
-    highpass.frequency.value = 70
-
-    const source = audioCtx.createMediaStreamSource(stream)
-    source.connect(highpass)
-    highpass.connect(compressor)
-    compressor.connect(inputGain)
-    inputGain.connect(analyser)
-
-    const detector = PitchDetector.forFloat32Array(analyser.fftSize)
-    const input = new Float32Array(detector.inputLength)
-
-    startTimeRef.current = audioCtx.currentTime
-    collectedRef.current = []
-    pendingRef.current = null
-    pitchBufRef.current = []
-    setNotes([])
     setRecordingState('recording')
-
-    const commitNote = (midi: number, startTime: number, endTime: number) => {
-      const duration = endTime - startTime
-      if (duration < MIN_NOTE_DURATION) return
-      const note: DetectedNote = { name: midiToNoteName(midi), midi, time: startTime, duration }
-      collectedRef.current = [...collectedRef.current, note]
-      setNotes([...collectedRef.current])
-    }
-
-    const tick = () => {
-      analyser.getFloatTimeDomainData(input)
-      const [pitch, clarity] = detector.findPitch(input, audioCtx.sampleRate)
-      const now = audioCtx.currentTime - startTimeRef.current
-
-      if (clarity > CLARITY_THRESHOLD && pitch > 70 && pitch < 1400) {
-        const rawMidi = freqToMidi(pitch)
-        pitchBufRef.current.push(rawMidi)
-        if (pitchBufRef.current.length > SMOOTH_FRAMES) pitchBufRef.current.shift()
-        const midi = medianMidi(pitchBufRef.current)
-
-        const pending = pendingRef.current
-        if (!pending) {
-          pendingRef.current = { midi, startTime: now }
-        } else if (Math.abs(midi - pending.midi) > NOTE_CHANGE_SEMITONES) {
-          commitNote(pending.midi, pending.startTime, now)
-          pendingRef.current = { midi, startTime: now }
-        }
-      } else {
-        pitchBufRef.current = []
-        const pending = pendingRef.current
-        if (pending) {
-          commitNote(pending.midi, pending.startTime, now)
-          pendingRef.current = null
-        }
-      }
-
-      rafRef.current = requestAnimationFrame(tick)
-    }
-
-    rafRef.current = requestAnimationFrame(tick)
   }, [bpm])
 
   const stopRecording = useCallback(() => {
-    stopDetection()
+    abortedRef.current = true   // カウントダウン中でも止められる
 
-    if (pendingRef.current && audioCtxRef.current) {
-      const now = audioCtxRef.current.currentTime - startTimeRef.current
-      const duration = now - pendingRef.current.startTime
-      if (duration >= MIN_NOTE_DURATION) {
-        const note: DetectedNote = {
-          name: midiToNoteName(pendingRef.current.midi),
-          midi: pendingRef.current.midi,
-          time: pendingRef.current.startTime,
-          duration,
-        }
-        collectedRef.current = [...collectedRef.current, note]
-        setNotes([...collectedRef.current])
-      }
-      pendingRef.current = null
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()   // onstop で解析が始まる
+    } else {
+      // まだ MediaRecorder が始まっていない（カウントダウン中など）
+      streamRef.current?.getTracks().forEach(t => t.stop())
+      setRecordingState('idle')
     }
-
-    mediaRecorderRef.current?.stop()
     mediaRecorderRef.current = null
     streamRef.current?.getTracks().forEach(t => t.stop())
-    audioCtxRef.current?.close()
-    setRecordingState('idle')
-  }, [stopDetection])
-
-  const isRecording = recordingState === 'recording'
-  const isCountingDown = recordingState === 'countdown'
+    streamRef.current = null
+  }, [])
 
   return {
     recordingState,
-    isRecording,
-    isCountingDown,
+    isRecording: recordingState === 'recording',
+    isCountingDown: recordingState === 'countdown',
+    isAnalyzing: recordingState === 'analyzing',
     countdownBeat,
     notes,
     recordedAudioUrl,

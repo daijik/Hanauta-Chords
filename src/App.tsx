@@ -30,6 +30,7 @@ function App() {
   const {
     isRecording,
     isCountingDown,
+    isAnalyzing,
     countdownBeat,
     notes,
     recordedAudioUrl,
@@ -113,7 +114,7 @@ function App() {
     }
   }
 
-  const isBusy = isRecording || isCountingDown
+  const isBusy = isRecording || isCountingDown || isAnalyzing
   const canPlay = notes.length > 0 && !isBusy
 
   return (
@@ -149,6 +150,12 @@ function App() {
                 録音中
               </span>
             )}
+            {isAnalyzing && (
+              <span className="flex items-center gap-2 text-blue-400 text-sm">
+                <span className="w-2 h-2 rounded-full bg-blue-400 animate-ping" />
+                音声を解析中...
+              </span>
+            )}
           </div>
 
           {/* BPM 設定 */}
@@ -180,7 +187,7 @@ function App() {
               disabled={isBusy}
               className="flex-1 py-3 rounded-xl font-medium bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {isCountingDown ? '準備中...' : '● 録音開始'}
+              {isCountingDown ? '準備中...' : isAnalyzing ? '解析中...' : '● 録音開始'}
             </button>
             <button
               onClick={stopRecording}
@@ -323,6 +330,14 @@ function App() {
               </div>
             )}
           </section>
+        )}
+
+        {isAnalyzing && (
+          <div className="text-center py-12 text-blue-400">
+            <p className="text-4xl mb-4 animate-pulse">🎼</p>
+            <p className="font-medium">鼻歌を解析して五線譜に変換中...</p>
+            <p className="text-sm mt-1 text-slate-500">録音音源からピッチを抽出しています</p>
+          </div>
         )}
 
         {notes.length === 0 && !isBusy && (
