@@ -1,5 +1,5 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
-import { PitchDetector } from 'pitchy'
+import { yinDetect } from '../lib/yin'
 
 export type DetectedNote = {
   name: string
@@ -21,7 +21,7 @@ function midiToNoteName(midi: number): string {
   return `${NOTE_NAMES[midi % 12]}${octave}`
 }
 
-// ─── クリック音を1発スケジュール ─────────────────────────────────────────────
+// ─── クリック音スケジューラー ────────────────────────────────────────────────
 
 function scheduleClick(ctx: AudioContext, time: number, accented: boolean) {
   const osc = ctx.createOscillator()
@@ -36,9 +36,6 @@ function scheduleClick(ctx: AudioContext, time: number, accented: boolean) {
   osc.stop(time + 0.08)
 }
 
-// ─── カウントダウン ──────────────────────────────────────────────────────────
-// startTime: AudioContext 上の絶対時刻（ctx.currentTime + 余裕）
-
 function scheduleCountdown(
   ctx: AudioContext,
   bpm: number,
@@ -50,27 +47,21 @@ function scheduleCountdown(
   for (let i = 0; i < beats; i++) {
     const t = startTime + i * beatDuration
     scheduleClick(ctx, t, i === 0)
-    // UI の拍表示は setTimeout で同期（Web Audio は別スレッドのため）
     setTimeout(() => onBeat(i + 1), Math.max(0, (t - ctx.currentTime) * 1000))
   }
-  // カウントダウン完了まで await
   const endTime = startTime + beats * beatDuration
   return new Promise(resolve =>
     setTimeout(resolve, Math.max(0, (endTime - ctx.currentTime) * 1000)),
   )
 }
 
-// ─── 録音中メトロノーム（look-ahead スケジューラー）──────────────────────────
-// 精密なタイミングのため「少し先を先読みして予約」を繰り返す方式
-
-const METRONOME_LOOKAHEAD = 0.4   // 秒: この分だけ先にスケジュール
-const METRONOME_INTERVAL = 150    // ms: スケジューラーの呼び出し間隔
+const METRONOME_LOOKAHEAD = 0.4
+const METRONOME_INTERVAL = 150
 
 function startMetronome(ctx: AudioContext, bpm: number, startTime: number): () => void {
   const beatDuration = 60 / bpm
   let nextBeatTime = startTime
   let beatIndex = 0
-
   const schedule = () => {
     while (nextBeatTime < ctx.currentTime + METRONOME_LOOKAHEAD) {
       scheduleClick(ctx, nextBeatTime, beatIndex % 4 === 0)
@@ -78,24 +69,28 @@ function startMetronome(ctx: AudioContext, bpm: number, startTime: number): () =
       beatIndex++
     }
   }
-
-  schedule()  // 初回は即実行
+  schedule()
   const id = setInterval(schedule, METRONOME_INTERVAL)
   return () => clearInterval(id)
 }
 
-// ─── PCM 解析 ────────────────────────────────────────────────────────────────
+// ─── オフライン解析パイプライン ──────────────────────────────────────────────
+//
+// PCM → YIN フレーム解析 → フィルタ → MIDI スナップ
+//   → モード平滑化 → プラトー検出 → BPM 量子化 → DetectedNote[]
+//
+// pitchy (MPM) から YIN に変更: ボーカル・鼻歌に対してオクターブ誤検出が少ない
 
-const ANALYSIS_WINDOW = 4096
-const HOP_DIVISOR = 80
-const CLARITY_THRESHOLD = 0.88
-const MIN_FREQ_HZ = 85
-const MAX_FREQ_HZ = 600
-const SMOOTH_FRAMES = 11
-const ONSET_FRAMES = 4
-const NOTE_CHANGE_SEMITONES = 1.0
-const MIN_NOTE_SEC = 0.18
-const RMS_NOISE_GATE = 0.008
+const YIN_WINDOW = 2048      // YIN の解析ウィンドウ（=ハーフが 1024、最低検出 ~43 Hz）
+const HOP_FPS = 25           // 解析フレームレート（1フレーム = 40ms）
+const YIN_THRESHOLD = 0.18   // YIN の CMNDF 閾値（小さいほど厳しい）
+const MIN_CLARITY = 0.55     // YIN の確信度最低ライン
+const MIN_FREQ = 80          // 鼻歌最低音（Hz）
+const MAX_FREQ = 650         // 鼻歌最高音（Hz）
+const RMS_GATE = 0.006       // 無音ゲート（RMS がこれ以下は無視）
+const SMOOTH_WINDOW = 7      // モード平滑化のフレーム数
+const MIN_NOTE_FRAMES = 3    // 音符と認定する最短フレーム数
+const NOTE_SNAP_SEMITONES = 0.5  // 同一音符とみなす半音幅（±0.5 以内なら同音）
 
 function rms(buf: Float32Array): number {
   let s = 0
@@ -103,87 +98,100 @@ function rms(buf: Float32Array): number {
   return Math.sqrt(s / buf.length)
 }
 
-function medianOf(arr: number[]): number {
-  const s = [...arr].sort((a, b) => a - b)
-  return s[Math.floor(s.length / 2)]
+// 配列の最頻値
+function modeOf(arr: number[]): number {
+  const count: Record<number, number> = {}
+  let maxN = 0
+  let mode = arr[0]
+  for (const v of arr) {
+    count[v] = (count[v] ?? 0) + 1
+    if (count[v] > maxN) { maxN = count[v]; mode = v }
+  }
+  return mode
 }
 
-function octaveCorrect(midi: number, prevMidi: number | null): number {
-  if (midi > 76 && (prevMidi === null || midi - prevMidi > 10)) return midi - 12
-  if (midi < 45 && (prevMidi === null || prevMidi - midi > 10)) return midi + 12
+// BPM グリッドに最も近い音符長を返す（16分音符〜全音符）
+const NOTE_DIVISIONS = [0.25, 0.375, 0.5, 0.75, 1, 1.5, 2, 3, 4]  // 拍数単位
+
+function quantizeDuration(seconds: number, bpm: number): number {
+  const beats = seconds / (60 / bpm)
+  let best = NOTE_DIVISIONS[0]
+  let bestErr = Infinity
+  for (const div of NOTE_DIVISIONS) {
+    const err = Math.abs(beats - div)
+    if (err < bestErr) { bestErr = err; best = div }
+  }
+  return best * (60 / bpm)
+}
+
+// オクターブ補正: 鼻歌音域（MIDI 45-80）を外れていたら 12 半音シフト
+function octaveCorrect(midi: number): number {
+  if (midi > 80) return midi - 12
+  if (midi < 45) return midi + 12
   return midi
 }
 
-type NoteState = 'silent' | 'onset' | 'stable'
+function analyzePCM(samples: Float32Array, sampleRate: number, bpm: number): DetectedNote[] {
+  const hopSize = Math.floor(sampleRate / HOP_FPS)
 
-function analyzePCM(samples: Float32Array, sampleRate: number): DetectedNote[] {
-  const detector = PitchDetector.forFloat32Array(ANALYSIS_WINDOW)
-  const hopSize = Math.floor(sampleRate / HOP_DIVISOR)
-  const notes: DetectedNote[] = []
+  // ── Phase 1: フレームごとに YIN 解析 ─────────────────────────────────────
+  type Frame = { time: number; midi: number }
+  const validFrames: Frame[] = []
 
-  let state: NoteState = 'silent'
-  let onsetCount = 0
-  let pitchBuf: number[] = []
-  let currentMidi = 0
-  let noteStart = 0
-  let prevCommittedMidi: number | null = null
-
-  const commit = (midi: number, start: number, end: number) => {
-    if (end - start >= MIN_NOTE_SEC) {
-      notes.push({ name: midiToNoteName(midi), midi, time: start, duration: end - start })
-      prevCommittedMidi = midi
-    }
-  }
-
-  for (let i = 0; i + ANALYSIS_WINDOW < samples.length; i += hopSize) {
-    const window = samples.slice(i, i + ANALYSIS_WINDOW)
+  for (let i = 0; i + YIN_WINDOW < samples.length; i += hopSize) {
+    const win = samples.slice(i, i + YIN_WINDOW)
     const time = i / sampleRate
-    const frameRms = rms(window)
 
-    if (frameRms < RMS_NOISE_GATE) {
-      if (state === 'stable') commit(currentMidi, noteStart, time)
-      state = 'silent'; onsetCount = 0; pitchBuf = []
-      continue
-    }
+    if (rms(win) < RMS_GATE) continue  // 無音スキップ
 
-    const [rawFreq, clarity] = detector.findPitch(window, sampleRate)
-    if (clarity < CLARITY_THRESHOLD || rawFreq < MIN_FREQ_HZ || rawFreq > MAX_FREQ_HZ) {
-      if (state === 'stable') commit(currentMidi, noteStart, time)
-      state = 'silent'; onsetCount = 0; pitchBuf = []
-      continue
-    }
+    const { pitch, clarity } = yinDetect(win, sampleRate, YIN_THRESHOLD)
+    if (clarity < MIN_CLARITY || pitch < MIN_FREQ || pitch > MAX_FREQ) continue
 
-    const rawMidi = freqToMidi(rawFreq)
-    const midi = octaveCorrect(rawMidi, prevCommittedMidi ?? (pitchBuf.length > 0 ? medianOf(pitchBuf) : null))
-    pitchBuf.push(midi)
-    if (pitchBuf.length > SMOOTH_FRAMES) pitchBuf.shift()
-    const smoothMidi = medianOf(pitchBuf)
-
-    switch (state) {
-      case 'silent':
-        state = 'onset'; onsetCount = 1; currentMidi = smoothMidi; noteStart = time
-        break
-      case 'onset':
-        if (Math.abs(smoothMidi - currentMidi) <= NOTE_CHANGE_SEMITONES) {
-          currentMidi = smoothMidi
-          if (++onsetCount >= ONSET_FRAMES) state = 'stable'
-        } else {
-          state = 'onset'; onsetCount = 1; currentMidi = smoothMidi; noteStart = time
-        }
-        break
-      case 'stable':
-        if (Math.abs(smoothMidi - currentMidi) > NOTE_CHANGE_SEMITONES) {
-          commit(currentMidi, noteStart, time)
-          state = 'onset'; onsetCount = 1; currentMidi = smoothMidi
-          noteStart = time; pitchBuf = [midi]
-        } else {
-          currentMidi = smoothMidi
-        }
-        break
-    }
+    const raw = freqToMidi(pitch)
+    const midi = octaveCorrect(raw)
+    validFrames.push({ time, midi })
   }
 
-  if (state === 'stable') commit(currentMidi, noteStart, samples.length / sampleRate)
+  if (validFrames.length === 0) return []
+
+  // ── Phase 2: モード平滑化（スライディングウィンドウで最頻値を取る）────────
+  // ランダムなノイズフレームを除去し、支配的な音程を残す
+  const smoothed: Frame[] = []
+  for (let i = 0; i < validFrames.length; i++) {
+    const lo = Math.max(0, i - Math.floor(SMOOTH_WINDOW / 2))
+    const hi = Math.min(validFrames.length, lo + SMOOTH_WINDOW)
+    const window = validFrames.slice(lo, hi).map(f => f.midi)
+    smoothed.push({ time: validFrames[i].time, midi: modeOf(window) })
+  }
+
+  // ── Phase 3: プラトー検出（同じ MIDI 音が連続するランをまとめる）──────────
+  const notes: DetectedNote[] = []
+  let runStart = 0
+
+  const commitRun = (endIdx: number) => {
+    const run = smoothed.slice(runStart, endIdx)
+    if (run.length < MIN_NOTE_FRAMES) return
+
+    // ランの中で最頻の MIDI を音符のピッチとする
+    const midi = modeOf(run.map(f => f.midi))
+    const startTime = run[0].time
+    const rawDuration = run[run.length - 1].time - startTime + (1 / HOP_FPS)
+    const duration = quantizeDuration(rawDuration, bpm)
+
+    notes.push({ name: midiToNoteName(midi), midi, time: startTime, duration })
+  }
+
+  for (let i = 1; i < smoothed.length; i++) {
+    const isGap = smoothed[i].time - smoothed[i - 1].time > (2 / HOP_FPS)  // 無音ギャップ
+    const isPitchChange = Math.abs(smoothed[i].midi - smoothed[i - 1].midi) > NOTE_SNAP_SEMITONES * 2
+
+    if (isGap || isPitchChange) {
+      commitRun(i)
+      runStart = i
+    }
+  }
+  commitRun(smoothed.length)
+
   return notes
 }
 
@@ -205,6 +213,8 @@ export function useAudioRecorder(bpm: number) {
   const prevUrlRef = useRef<string | null>(null)
   const abortedRef = useRef(false)
   const sampleRateRef = useRef(44100)
+  const bpmRef = useRef(bpm)
+  useEffect(() => { bpmRef.current = bpm }, [bpm])
 
   useEffect(() => {
     return () => { if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current) }
@@ -224,36 +234,29 @@ export function useAudioRecorder(bpm: number) {
     })
     streamRef.current = stream
 
-    // ── AudioContext を1つだけ作成し、カウントダウン〜録音〜メトロノームを通して使う ──
-    // ※ 別 AudioContext を使うと起動遅延で1クリック目が消えるため統一する
     const audioCtx = new AudioContext()
     audioCtxRef.current = audioCtx
     sampleRateRef.current = audioCtx.sampleRate
-
-    // AudioContext が suspended 状態なら resume して確実に動作させる
     if (audioCtx.state === 'suspended') await audioCtx.resume()
 
-    // ScriptProcessorNode を先にセットアップ（PCM キャプチャ）
+    // PCM キャプチャチェーン（スピーカーには出さない）
     const source = audioCtx.createMediaStreamSource(stream)
     const highpass = audioCtx.createBiquadFilter()
     highpass.type = 'highpass'
     highpass.frequency.value = 70
-
     const micGain = audioCtx.createGain()
     micGain.gain.value = 4.0
-
     const scriptNode = audioCtx.createScriptProcessor(2048, 1, 1)
     scriptNodeRef.current = scriptNode
     pcmChunksRef.current = []
-    // PCM 収集は録音開始後に有効化するためフラグで制御
+    const silentGain = audioCtx.createGain()
+    silentGain.gain.value = 0
+
     let capturing = false
     scriptNode.onaudioprocess = (e) => {
       if (!capturing) return
       pcmChunksRef.current.push(new Float32Array(e.inputBuffer.getChannelData(0)))
     }
-
-    const silentGain = audioCtx.createGain()
-    silentGain.gain.value = 0
 
     source.connect(highpass)
     highpass.connect(micGain)
@@ -261,8 +264,7 @@ export function useAudioRecorder(bpm: number) {
     scriptNode.connect(silentGain)
     silentGain.connect(audioCtx.destination)
 
-    // ── カウントダウン ────────────────────────────────────────────
-    // AudioContext が十分 warm になるよう 0.3 秒の余裕を持たせる
+    // カウントダウン（AudioContext warm-up 後に 0.3s 余裕を持たせる）
     const WARMUP = 0.3
     const beatDuration = 60 / bpm
     const countdownStart = audioCtx.currentTime + WARMUP
@@ -273,23 +275,16 @@ export function useAudioRecorder(bpm: number) {
     setCountdownBeat(0)
 
     if (abortedRef.current) {
-      scriptNode.disconnect()
-      source.disconnect()
-      stream.getTracks().forEach(t => t.stop())
-      audioCtx.close()
-      setRecordingState('idle')
-      return
+      scriptNode.disconnect(); source.disconnect()
+      stream.getTracks().forEach(t => t.stop()); audioCtx.close()
+      setRecordingState('idle'); return
     }
 
-    // ── 録音開始（PCM キャプチャ ON）──────────────────────────────
+    // 録音開始
     capturing = true
-
-    // カウントダウン終了直後からメトロノーム開始（グリッドを繋げる）
     const recordingStart = countdownStart + 4 * beatDuration
-    const stopMetronome = startMetronome(audioCtx, bpm, recordingStart)
-    stopMetronomeRef.current = stopMetronome
+    stopMetronomeRef.current = startMetronome(audioCtx, bpm, recordingStart)
 
-    // MediaRecorder（再生用）
     audioChunksRef.current = []
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
     const mr = new MediaRecorder(stream, { mimeType })
@@ -305,8 +300,8 @@ export function useAudioRecorder(bpm: number) {
         const totalLen = pcmChunksRef.current.reduce((s, c) => s + c.length, 0)
         const pcm = new Float32Array(totalLen)
         let ofs = 0
-        for (const chunk of pcmChunksRef.current) { pcm.set(chunk, ofs); ofs += chunk.length }
-        setNotes(analyzePCM(pcm, sampleRateRef.current))
+        for (const c of pcmChunksRef.current) { pcm.set(c, ofs); ofs += c.length }
+        setNotes(analyzePCM(pcm, sampleRateRef.current, bpmRef.current))
       } catch (err) {
         console.error('音声解析エラー:', err)
       } finally {
@@ -320,16 +315,11 @@ export function useAudioRecorder(bpm: number) {
 
   const stopRecording = useCallback(() => {
     abortedRef.current = true
-
-    // メトロノームを止める
-    stopMetronomeRef.current?.()
-    stopMetronomeRef.current = null
-
-    scriptNodeRef.current?.disconnect()
-    scriptNodeRef.current = null
+    stopMetronomeRef.current?.(); stopMetronomeRef.current = null
+    scriptNodeRef.current?.disconnect(); scriptNodeRef.current = null
 
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop()   // onstop → 解析へ
+      mediaRecorderRef.current.stop()
     } else {
       streamRef.current?.getTracks().forEach(t => t.stop())
       audioCtxRef.current?.close()
@@ -338,8 +328,7 @@ export function useAudioRecorder(bpm: number) {
     mediaRecorderRef.current = null
     streamRef.current?.getTracks().forEach(t => t.stop())
     audioCtxRef.current?.close()
-    streamRef.current = null
-    audioCtxRef.current = null
+    streamRef.current = null; audioCtxRef.current = null
   }, [])
 
   return {
