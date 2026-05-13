@@ -21,6 +21,33 @@ function quantizeDuration(secs: number, bpm: number): number {
   return Math.round(best * beat * 1000) / 1000
 }
 
+const TARGET_SAMPLE_RATE = 22050  // Basic Pitch が要求するサンプルレート
+
+/** Blob を 22050 Hz モノラル AudioBuffer にデコード＆リサンプリング */
+async function decodeAs22050(blob: Blob): Promise<AudioBuffer> {
+  const arrayBuffer = await blob.arrayBuffer()
+
+  // まず元のサンプルレートでデコード
+  const tmpCtx = new AudioContext()
+  let native: AudioBuffer
+  try {
+    native = await tmpCtx.decodeAudioData(arrayBuffer)
+  } finally {
+    tmpCtx.close()
+  }
+
+  if (native.sampleRate === TARGET_SAMPLE_RATE) return native
+
+  // OfflineAudioContext でリサンプリング（ブラウザの高品質リサンプラを使用）
+  const numFrames = Math.ceil(native.duration * TARGET_SAMPLE_RATE)
+  const offCtx = new OfflineAudioContext(1, numFrames, TARGET_SAMPLE_RATE)
+  const src = offCtx.createBufferSource()
+  src.buffer = native
+  src.connect(offCtx.destination)
+  src.start(0)
+  return offCtx.startRendering()
+}
+
 // モデルインスタンスをキャッシュ（ページリロードまで再利用）
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let cachedBp: any = null
@@ -39,15 +66,8 @@ export async function detectPitchWithML(blob: Blob, bpm: number): Promise<Detect
     cachedBp = new BasicPitch('/basic-pitch-model/model.json')
   }
 
-  // 録音 Blob → AudioBuffer（BasicPitch が内部でリサンプリング）
-  const arrayBuffer = await blob.arrayBuffer()
-  const ctx = new AudioContext()
-  let audioBuffer: AudioBuffer
-  try {
-    audioBuffer = await ctx.decodeAudioData(arrayBuffer)
-  } finally {
-    ctx.close()
-  }
+  // 録音 Blob → 22050 Hz AudioBuffer（Basic Pitch が要求するサンプルレート）
+  const audioBuffer = await decodeAs22050(blob)
 
   // ── BasicPitch 推論 ────────────────────────────────────────────────────────
   const frames: number[][] = []
