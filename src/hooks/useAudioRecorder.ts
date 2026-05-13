@@ -1,4 +1,5 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
+import { detectPitchWithML } from '../lib/pitchDetection'
 
 export type DetectedNote = {
   name: string
@@ -62,60 +63,6 @@ function startMetronome(ctx: AudioContext, bpm: number, startTime: number): () =
   return () => clearInterval(id)
 }
 
-// ─── Blob → WAV 変換 ────────────────────────────────────────────────────────
-// MediaRecorder は webm/ogg (lossy) で録音するが、Python 側は WAV を期待する。
-// AudioContext でデコードして Int16 WAV に再エンコードしてから送信する。
-
-function encodeWav(samples: Float32Array, sampleRate: number): Blob {
-  const numCh = 1
-  const bps = 16
-  const blockAlign = numCh * (bps / 8)
-  const dataSize = samples.length * blockAlign
-  const buf = new ArrayBuffer(44 + dataSize)
-  const v = new DataView(buf)
-  const s = (off: number, str: string) =>
-    [...str].forEach((c, i) => v.setUint8(off + i, c.charCodeAt(0)))
-  s(0, 'RIFF');  v.setUint32(4, 36 + dataSize, true)
-  s(8, 'WAVE'); s(12, 'fmt ')
-  v.setUint32(16, 16, true);       v.setUint16(20, 1, true)  // PCM
-  v.setUint16(22, numCh, true);    v.setUint32(24, sampleRate, true)
-  v.setUint32(28, sampleRate * blockAlign, true)
-  v.setUint16(32, blockAlign, true); v.setUint16(34, bps, true)
-  s(36, 'data'); v.setUint32(40, dataSize, true)
-  const out = new Int16Array(buf, 44)
-  for (let i = 0; i < samples.length; i++) {
-    out[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767)))
-  }
-  return new Blob([buf], { type: 'audio/wav' })
-}
-
-async function blobToWav(blob: Blob): Promise<Blob> {
-  const arrayBuffer = await blob.arrayBuffer()
-  const ctx = new AudioContext()
-  let audioBuffer: AudioBuffer
-  try {
-    audioBuffer = await ctx.decodeAudioData(arrayBuffer)
-  } finally {
-    ctx.close()
-  }
-  return encodeWav(audioBuffer.getChannelData(0), audioBuffer.sampleRate)
-}
-
-// ─── Python API 呼び出し ─────────────────────────────────────────────────────
-
-async function analyzeWithPython(blob: Blob, bpm: number): Promise<DetectedNote[]> {
-  const wavBlob = await blobToWav(blob)
-  const res = await fetch(`/api/analyze?bpm=${bpm}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'audio/wav' },
-    body: wavBlob,
-  })
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error ?? res.statusText)
-  }
-  return res.json()
-}
 
 // ─── Hook ───────────────────────────────────────────────────────────────────
 
@@ -191,7 +138,7 @@ export function useAudioRecorder(bpm: number) {
       // Python API で解析
       setRecordingState('analyzing')
       try {
-        const detected = await analyzeWithPython(blob, bpmRef.current)
+        const detected = await detectPitchWithML(blob, bpmRef.current)
         setNotes(detected)
       } catch (err) {
         console.error('解析エラー:', err)

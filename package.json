@@ -11,6 +11,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@spotify/basic-pitch": "^1.0.1",
     "express": "^5.2.1",
     "pitchy": "^4.1.0",
     "react": "^19.2.6",
