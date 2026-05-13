@@ -42,11 +42,18 @@ function App() {
   const [selectedPattern, setSelectedPattern] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [playState, setPlayState] = useState<PlayState>('idle')
+  const [pitchShift, setPitchShift] = useState(0)
   const stopPlaybackRef = useRef<(() => void) | null>(null)
   const originalAudioRef = useRef<HTMLAudioElement | null>(null)
 
-  const patterns = useMemo(() => generateChordPatterns(notes), [notes])
-  const keyLabel = useMemo(() => getKeyLabel(notes), [notes])
+  // ピッチ補正を適用した音符列（全ての表示・再生に使う）
+  const shiftedNotes = useMemo(
+    () => notes.map(n => ({ ...n, midi: n.midi + pitchShift })),
+    [notes, pitchShift],
+  )
+
+  const patterns = useMemo(() => generateChordPatterns(shiftedNotes), [shiftedNotes])
+  const keyLabel = useMemo(() => getKeyLabel(shiftedNotes), [shiftedNotes])
   const current = patterns[selectedPattern] ?? patterns[0]
 
   const handleStart = async () => {
@@ -75,14 +82,16 @@ function App() {
     let durationSec: number
 
     if (type === 'melody') {
-      stop = playMelody(notes)
-      durationSec = Math.max(...notes.map(n => n.time + n.duration)) + 1
+      stop = playMelody(shiftedNotes)
+      durationSec = Math.max(...shiftedNotes.map(n => n.time + n.duration)) + 1
     } else if (type === 'chord') {
       stop = playChordPattern(current.chords, bpm)
       durationSec = current.chords.length * (60 / bpm) * 2 + 1
     } else {
-      stop = playMelodyWithChords(notes, current.chords, bpm)
-      durationSec = Math.max(...notes.map(n => n.time + n.duration)) + 1
+      stop = playMelodyWithChords(shiftedNotes, current.chords, bpm)
+      const melodyDur = Math.max(...shiftedNotes.map(n => n.time + n.duration))
+      const chordDur = current.chords.length * (60 / bpm) * 2
+      durationSec = Math.max(melodyDur, chordDur) + 1
     }
 
     setPlayState(type)
@@ -161,7 +170,7 @@ function App() {
 
           {/* BPM 設定 */}
           <div className="flex items-center gap-3">
-            <label className="text-sm text-slate-400 shrink-0">BPM</label>
+            <label className="text-sm text-slate-400 shrink-0 w-8">BPM</label>
             <input
               type="range"
               min={40}
@@ -181,6 +190,25 @@ function App() {
               className="w-16 text-center bg-slate-700 rounded-lg px-2 py-1 text-sm disabled:opacity-40 [appearance:textfield]"
             />
           </div>
+
+          {/* ピッチ補正（音符が高すぎ/低すぎるときに調整） */}
+          {notes.length > 0 && (
+            <div className="flex items-center gap-3">
+              <label className="text-sm text-slate-400 shrink-0 w-8">音程</label>
+              <input
+                type="range"
+                min={-6}
+                max={6}
+                step={1}
+                value={pitchShift}
+                onChange={e => setPitchShift(Number(e.target.value))}
+                className="flex-1 accent-teal-500"
+              />
+              <span className="w-16 text-center bg-slate-700 rounded-lg px-2 py-1 text-sm text-slate-200">
+                {pitchShift > 0 ? `+${pitchShift}` : pitchShift} 半音
+              </span>
+            </div>
+          )}
 
           <div className="flex gap-3">
             <button
@@ -260,7 +288,7 @@ function App() {
               )
             )}
           </div>
-          <SheetMusic notes={notes} />
+          <SheetMusic notes={shiftedNotes} />
         </section>
 
         {/* Chord patterns */}

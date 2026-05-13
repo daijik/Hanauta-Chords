@@ -121,7 +121,6 @@ export function playMelodyWithChords(
   chords: string[],
   bpm = 72,
 ): () => void {
-  void bpm  // 将来の拍割り改善用に保持
   if (notes.length === 0) return () => {}
   const ctx = new AudioContext()
   const master = createOutputChain(ctx)
@@ -134,8 +133,9 @@ export function playMelodyWithChords(
     playTone(ctx, master, midiToFreq(note.midi), now + note.time, note.duration, 0.6, 'sine')
   }
 
-  // コード（メロディより少し小さく）
-  const chordDuration = totalMelodyDuration / chords.length
+  // コード: BPM ベースで 2 拍ずつ変わる（メロディを均等分割する旧方式はタイミングがズレていた）
+  const beatDuration = 60 / bpm
+  const chordDuration = beatDuration * 2
   chords.forEach((chord, ci) => {
     const startTime = now + ci * chordDuration
     const root = chordRootMidi(chord)
@@ -145,7 +145,9 @@ export function playMelodyWithChords(
     })
   })
 
-  const timeoutId = setTimeout(() => ctx.close(), (totalMelodyDuration + 1) * 1000)
+  const totalChordDuration = chords.length * chordDuration
+  const stopAt = Math.max(totalMelodyDuration, totalChordDuration) + 1
+  const timeoutId = setTimeout(() => ctx.close(), stopAt * 1000)
   return () => { clearTimeout(timeoutId); ctx.close() }
 }
 
