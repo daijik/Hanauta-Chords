@@ -14,47 +14,52 @@ function noteNameToMidi(name: string): number {
   return noteIdx + (octave + 1) * 12
 }
 
+// 出力チェーン: オシレーター → ノートゲイン → マスターゲイン → コンプレッサー → destination
+function createOutputChain(ctx: AudioContext) {
+  const master = ctx.createGain()
+  master.gain.value = 1.8  // 全体音量を底上げ
+
+  const compressor = ctx.createDynamicsCompressor()
+  compressor.threshold.value = -12
+  compressor.knee.value = 6
+  compressor.ratio.value = 3
+  compressor.attack.value = 0.01
+  compressor.release.value = 0.15
+
+  master.connect(compressor)
+  compressor.connect(ctx.destination)
+  return master
+}
+
 function playTone(
   ctx: AudioContext,
+  dest: AudioNode,
   freq: number,
   startTime: number,
   duration: number,
-  gain = 0.25,
-  type: OscillatorType = 'sine',
+  gain: number,
+  type: OscillatorType,
 ) {
   const osc = ctx.createOscillator()
   const gainNode = ctx.createGain()
+
   osc.connect(gainNode)
-  gainNode.connect(ctx.destination)
+  gainNode.connect(dest)
+
   osc.type = type
   osc.frequency.value = freq
-  gainNode.gain.setValueAtTime(gain, startTime)
-  gainNode.gain.exponentialRampToValueAtTime(0.001, startTime + duration * 0.95)
+
+  // アタック: 急な立ち上がりでクリックノイズを防ぐ
+  gainNode.gain.setValueAtTime(0, startTime)
+  gainNode.gain.linearRampToValueAtTime(gain, startTime + 0.02)
+  gainNode.gain.setValueAtTime(gain, startTime + duration * 0.75)
+  gainNode.gain.exponentialRampToValueAtTime(0.001, startTime + duration)
+
   osc.start(startTime)
-  osc.stop(startTime + duration)
+  osc.stop(startTime + duration + 0.01)
 }
 
-export function playMelody(notes: DetectedNote[]): () => void {
-  if (notes.length === 0) return () => {}
-  const ctx = new AudioContext()
-
-  const now = ctx.currentTime + 0.05
-  for (const note of notes) {
-    const freq = midiToFreq(note.midi)
-    playTone(ctx, freq, now + note.time, note.duration, 0.3, 'sine')
-  }
-
-  const totalDuration = Math.max(...notes.map(n => n.time + n.duration))
-  const stopAt = now + totalDuration + 0.3
-  const timeoutId = setTimeout(() => ctx.close(), (stopAt - ctx.currentTime) * 1000)
-
-  return () => {
-    clearTimeout(timeoutId)
-    ctx.close()
-  }
-}
-
-// コード名 → 構成音の MIDI オフセット（ルート音からの半音数）
+// コード名 → 構成音の MIDI オフセット
 function chordIntervals(chordName: string): number[] {
   if (chordName.endsWith('maj7'))  return [0, 4, 7, 11]
   if (chordName.endsWith('m7♭5')) return [0, 3, 6, 10]
@@ -70,11 +75,29 @@ function chordRootMidi(chordName: string): number {
   return 48 + idx  // C3 ベース
 }
 
+export function playMelody(notes: DetectedNote[]): () => void {
+  if (notes.length === 0) return () => {}
+  const ctx = new AudioContext()
+  const master = createOutputChain(ctx)
+
+  const now = ctx.currentTime + 0.05
+  for (const note of notes) {
+    const freq = midiToFreq(note.midi)
+    playTone(ctx, master, freq, now + note.time, note.duration, 0.65, 'sine')
+  }
+
+  const totalDuration = Math.max(...notes.map(n => n.time + n.duration))
+  const timeoutId = setTimeout(() => ctx.close(), (totalDuration + 1) * 1000)
+  return () => { clearTimeout(timeoutId); ctx.close() }
+}
+
 export function playChordPattern(chords: string[], bpm = 72): () => void {
   if (chords.length === 0) return () => {}
   const ctx = new AudioContext()
+  const master = createOutputChain(ctx)
+
   const beatDuration = 60 / bpm
-  const chordDuration = beatDuration * 2  // 各コードを2拍
+  const chordDuration = beatDuration * 2
 
   const now = ctx.currentTime + 0.05
   chords.forEach((chord, ci) => {
@@ -82,21 +105,15 @@ export function playChordPattern(chords: string[], bpm = 72): () => void {
     const root = chordRootMidi(chord)
     const intervals = chordIntervals(chord)
     intervals.forEach((interval, ii) => {
-      const midi = root + interval
-      const freq = midiToFreq(midi)
-      // アルペジオ風に少しずらして弾く
-      const offset = ii * 0.04
-      playTone(ctx, freq, startTime + offset, chordDuration - 0.05, 0.2, 'triangle')
+      const freq = midiToFreq(root + interval)
+      const offset = ii * 0.05  // アルペジオ
+      playTone(ctx, master, freq, startTime + offset, chordDuration - 0.08, 0.45, 'triangle')
     })
   })
 
-  const totalDuration = chords.length * chordDuration + 0.5
-  const timeoutId = setTimeout(() => ctx.close(), totalDuration * 1000 + 500)
-
-  return () => {
-    clearTimeout(timeoutId)
-    ctx.close()
-  }
+  const totalDuration = chords.length * chordDuration + 1
+  const timeoutId = setTimeout(() => ctx.close(), totalDuration * 1000)
+  return () => { clearTimeout(timeoutId); ctx.close() }
 }
 
 export function playMelodyWithChords(
@@ -105,36 +122,29 @@ export function playMelodyWithChords(
 ): () => void {
   if (notes.length === 0) return () => {}
   const ctx = new AudioContext()
-  const now = ctx.currentTime + 0.05
+  const master = createOutputChain(ctx)
 
-  // メロディ
+  const now = ctx.currentTime + 0.05
+  const totalMelodyDuration = Math.max(...notes.map(n => n.time + n.duration))
+
+  // メロディ（やや大きめ）
   for (const note of notes) {
-    const freq = midiToFreq(note.midi)
-    playTone(ctx, freq, now + note.time, note.duration, 0.3, 'sine')
+    playTone(ctx, master, midiToFreq(note.midi), now + note.time, note.duration, 0.6, 'sine')
   }
 
-  // コード（メロディの長さに合わせて均等割り）
-  const totalMelodyDuration = Math.max(...notes.map(n => n.time + n.duration))
+  // コード（メロディより少し小さく）
   const chordDuration = totalMelodyDuration / chords.length
   chords.forEach((chord, ci) => {
     const startTime = now + ci * chordDuration
     const root = chordRootMidi(chord)
-    const intervals = chordIntervals(chord)
-    intervals.forEach((interval, ii) => {
-      const midi = root + interval
-      const freq = midiToFreq(midi)
-      playTone(ctx, freq, startTime + ii * 0.04, chordDuration - 0.05, 0.15, 'triangle')
+    chordIntervals(chord).forEach((interval, ii) => {
+      const freq = midiToFreq(root + interval)
+      playTone(ctx, master, freq, startTime + ii * 0.05, chordDuration - 0.08, 0.30, 'triangle')
     })
   })
 
-  const stopAt = now + totalMelodyDuration + 0.5
-  const timeoutId = setTimeout(() => ctx.close(), (stopAt - ctx.currentTime) * 1000 + 500)
-
-  return () => {
-    clearTimeout(timeoutId)
-    ctx.close()
-  }
+  const timeoutId = setTimeout(() => ctx.close(), (totalMelodyDuration + 1) * 1000)
+  return () => { clearTimeout(timeoutId); ctx.close() }
 }
 
-// 音符名→MIDIの変換（外部参照用）
 export { noteNameToMidi }
