@@ -149,7 +149,11 @@ export function useAudioRecorder(bpm: number) {
     abortedRef.current = false
 
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,  // true にするとポンピングが発生して音質が不自然になる
+      },
     })
     streamRef.current = stream
 
@@ -180,7 +184,7 @@ export function useAudioRecorder(bpm: number) {
 
     audioChunksRef.current = []
     const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
-    const mr = new MediaRecorder(stream, { mimeType })
+    const mr = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 128000 })
     mr.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data) }
     mr.onstop = async () => {
       const blob = new Blob(audioChunksRef.current, { type: mimeType })
