@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-鼻歌音声ファイルを解析して音符列を JSON で返す。
-crepe（Google 製歌声ピッチ検出 NN）+ librosa を使用。
-使い方: python analyze.py <audio_file> <bpm>
+鼻歌音声（WAV）を Praat の自己相関ピッチ解析で音符列に変換して JSON で返す。
+使い方: python analyze.py <wav_file> <bpm>
 """
 
 import sys
@@ -11,142 +10,134 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
-import librosa
-import crepe
+import parselmouth
+from parselmouth.praat import call
+
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
 def freq_to_midi(freq: float) -> int:
-    if freq <= 0:
-        return -1
     return int(round(12 * np.log2(freq / 440.0) + 69))
 
 
 def midi_to_note_name(midi: int) -> str:
-    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-    octave = midi // 12 - 1
-    return f"{names[midi % 12]}{octave}"
+    return f"{NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
 
 
 def quantize_duration(seconds: float, bpm: float) -> float:
-    """音符長を BPM グリッドに量子化（16分〜全音符）"""
     beat = 60.0 / bpm
     divisions = [0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
     beats = seconds / beat
     best = min(divisions, key=lambda d: abs(d - beats))
-    return best * beat
+    return round(best * beat, 3)
 
 
-def analyze(audio_path: str, bpm: float) -> list[dict]:
-    # ─── 1. 音声読み込み（22050 Hz モノラルにリサンプル）────────────────────
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+def analyze(wav_path: str, bpm: float) -> list[dict]:
+    sound = parselmouth.Sound(wav_path)
 
-    # ─── 2. crepe でピッチ推定 ────────────────────────────────────────────────
-    # step_size: フレーム間隔（ms）。10ms = 100fps
-    # model: tiny/small/medium/large/full から選択。small がバランス良い
-    time_arr, freq_arr, confidence_arr, _ = crepe.predict(
-        y, sr,
-        model_capacity="small",
-        step_size=10,
-        viterbi=True,       # ビタービ復号で時間方向に滑らかなピッチ曲線に
-        verbose=0,
+    # ─── Praat 自己相関ピッチ追跡 ────────────────────────────────────────────
+    # Praat の "To Pitch (ac)" は人の声・歌声に最適化されたアルゴリズム。
+    # viterbi 的な Viterbi 解（最適経路）を使って時間方向に滑らかなピッチ曲線を得る。
+    pitch = call(
+        sound, "To Pitch (ac)...",
+        0.01,   # time_step (s): 10ms フレームレート
+        80.0,   # pitch_floor (Hz): 鼻歌最低域
+        15,     # max_candidates
+        True,   # very_accurate (SHS 事前候補)
+        0.03,   # silence_threshold
+        0.40,   # voicing_threshold: 低めにして有声フレームを多く取る
+        0.01,   # octave_cost
+        0.35,   # octave_jump_cost
+        0.14,   # voiced_unvoiced_cost
+        600.0,  # pitch_ceiling (Hz): 鼻歌最高域
     )
 
-    # ─── 3. フィルタリング ────────────────────────────────────────────────────
-    MIN_CONFIDENCE = 0.55   # 確信度の下限
-    MIN_FREQ = 80.0         # Hz（鼻歌の最低域）
-    MAX_FREQ = 700.0        # Hz（鼻歌の最高域）
+    n_frames = int(call(pitch, "Get number of frames"))
+    time_step = call(pitch, "Get time step")
+    start_t   = call(pitch, "Get start time")
 
-    valid_mask = (
-        (confidence_arr >= MIN_CONFIDENCE) &
-        (freq_arr >= MIN_FREQ) &
-        (freq_arr <= MAX_FREQ)
-    )
+    # ─── フレームごとに F0 を取得 ─────────────────────────────────────────────
+    times:  list[float] = []
+    f0s:    list[float] = []
 
-    # ─── 4. MIDI スナップ + モード平滑化 ─────────────────────────────────────
-    midi_arr = np.array([freq_to_midi(f) if m else -1
-                         for f, m in zip(freq_arr, valid_mask)])
+    for i in range(1, n_frames + 1):
+        t  = start_t + (i - 1) * time_step
+        f0 = call(pitch, "Get value in frame", i, "Hertz")
+        times.append(t)
+        # NaN = 無声フレーム → 0 に統一
+        f0s.append(f0 if (f0 and not np.isnan(f0)) else 0.0)
 
-    # 有効フレームだけ保持
-    valid_idx = np.where(valid_mask)[0]
-    if len(valid_idx) == 0:
-        return []
+    times = np.array(times)
+    f0s   = np.array(f0s)
 
-    # 7フレームのモードフィルタ（最頻値でスムージング）
-    SMOOTH = 7
-    smoothed_midi = midi_arr.copy()
-    for i in valid_idx:
+    # ─── MIDI 変換 + モード平滑化 ─────────────────────────────────────────────
+    midi_arr = np.where(f0s > 0, np.round(12 * np.log2(
+        np.where(f0s > 0, f0s, 440) / 440.0) + 69).astype(int), -1)
+
+    SMOOTH = 9   # 9フレーム × 10ms = 90ms ウィンドウでモードフィルタ
+    smoothed = midi_arr.copy()
+    voiced_idx = np.where(midi_arr >= 0)[0]
+    for i in voiced_idx:
         lo = max(0, i - SMOOTH // 2)
         hi = min(len(midi_arr), lo + SMOOTH)
         window = midi_arr[lo:hi]
         window = window[window >= 0]
         if len(window) > 0:
             vals, counts = np.unique(window, return_counts=True)
-            smoothed_midi[i] = vals[np.argmax(counts)]
+            smoothed[i] = vals[np.argmax(counts)]
 
-    # ─── 5. プラトー検出（連続する同 MIDI ランを1音符に集約）────────────────
-    notes = []
-    run_start_idx = None
+    # ─── プラトー検出 → 音符確定 ──────────────────────────────────────────────
+    notes: list[dict] = []
+    run_start: int | None = None
     prev_midi = -1
+    MIN_FRAMES = 4  # 最短 4 フレーム = 40ms
 
     def commit(end_idx: int):
-        nonlocal run_start_idx
-        if run_start_idx is None:
+        nonlocal run_start
+        if run_start is None:
             return
-        run = [(i, smoothed_midi[i]) for i in range(run_start_idx, end_idx)
-               if smoothed_midi[i] >= 0]
-        if len(run) < 3:   # 最短 3 フレーム（30ms）
-            run_start_idx = None
+        run_indices = [j for j in range(run_start, end_idx) if smoothed[j] >= 0]
+        if len(run_indices) < MIN_FRAMES:
+            run_start = None
             return
-        midi = int(np.bincount([r[1] for r in run]).argmax())
-        start_time = float(time_arr[run[0][0]])
-        raw_dur = float(time_arr[run[-1][0]]) - start_time + 0.01
-        duration = quantize_duration(raw_dur, bpm)
+        midi = int(np.bincount([smoothed[j] for j in run_indices]).argmax())
+        start_time = float(times[run_indices[0]])
+        raw_dur    = float(times[run_indices[-1]]) - start_time + 0.01
+        duration   = quantize_duration(raw_dur, bpm)
         notes.append({
-            "name": midi_to_note_name(midi),
-            "midi": midi,
-            "time": round(start_time, 3),
-            "duration": round(duration, 3),
+            "name":     midi_to_note_name(midi),
+            "midi":     midi,
+            "time":     round(start_time, 3),
+            "duration": duration,
         })
-        run_start_idx = None
+        run_start = None
 
-    for i in valid_idx:
-        midi = smoothed_midi[i]
+    for i in voiced_idx:
+        midi = smoothed[i]
         if midi < 0:
             continue
-
-        # 新しいランの開始
-        if run_start_idx is None:
-            run_start_idx = i
+        if run_start is None:
+            run_start = i
             prev_midi = midi
             continue
-
-        # 無音ギャップ（前フレームとの時刻差が 80ms 超）
-        time_gap = time_arr[i] - time_arr[i - 1] if i > 0 else 0
-        is_gap = time_gap > 0.08
-
-        # 音程変化（2半音以上）
-        is_pitch_change = abs(int(midi) - int(prev_midi)) >= 2
-
-        if is_gap or is_pitch_change:
+        # 無音ギャップ（80ms 超）または音程変化（2 半音以上）で区切る
+        gap = times[i] - times[i - 1] if i > 0 else 0
+        if gap > 0.08 or abs(int(midi) - int(prev_midi)) >= 2:
             commit(i)
-            run_start_idx = i
-
+            run_start = i
         prev_midi = midi
 
-    commit(len(smoothed_midi))
+    commit(len(smoothed))
     return notes
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(json.dumps({"error": "usage: analyze.py <audio_file> <bpm>"}))
+        print(json.dumps({"error": "usage: analyze.py <wav_file> <bpm>"}))
         sys.exit(1)
-
-    audio_path = sys.argv[1]
-    bpm = float(sys.argv[2])
-
     try:
-        result = analyze(audio_path, bpm)
+        result = analyze(sys.argv[1], float(sys.argv[2]))
         print(json.dumps(result))
     except Exception as e:
         print(json.dumps({"error": str(e)}))

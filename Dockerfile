@@ -2,10 +2,7 @@
 FROM registry.access.redhat.com/ubi9/nodejs-20:latest AS dev
 
 USER root
-
-# Python 3 + pip + 音声処理に必要なシステムライブラリをインストール
 RUN dnf install -y python3 python3-pip libsndfile && dnf clean all
-
 RUN mkdir -p /app && chown -R 1001:0 /app
 USER 1001
 

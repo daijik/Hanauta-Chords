@@ -25,7 +25,7 @@ app.post('/api/stop', (_req, res) => {
 // ── 音声解析（Python crepe へ委譲）──────────────────────────────────────────
 app.post('/api/analyze', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
   const bpm = parseFloat(req.query.bpm) || 120
-  const tmpFile = join(TMP_DIR, `${randomUUID()}.webm`)
+  const tmpFile = join(TMP_DIR, `${randomUUID()}.wav`)
 
   try {
     await writeFile(tmpFile, req.body)
